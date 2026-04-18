@@ -8,17 +8,15 @@ services:
     volumes:
       - .:/app
     ports:
-      - '8080:8080'
-      - '1337:8080'
-      - '7900:7900'
+      - '8080:8080'  # Solo uno si no necesitas acceso múltiple
     environment:
       - OLLAMA_HOST=host.docker.internal
     labels:
       - traefik.enable=true
-      - traefik.http.routers.next-app.rule=Host(`next-app.dokploy.com`)
-      - traefik.http.routers.next-app.entrypoints=websecure
-      - traefik.http.routers.next-app.tls.certResolver=letsencrypt
-      - traefik.http.services.next-app.loadbalancer.server.port=3000
+      - traefik.http.routers.g4f.rule=Host(`gpt4free.cloud.karlincoder.com`)  # Ajusta el host
+      - traefik.http.routers.g4f.entrypoints=websecure
+      - traefik.http.routers.g4f.tls.certResolver=letsencrypt
+      - traefik.http.services.g4f.loadbalancer.server.port=8080  # ← Puerto interno real
 networks:
   dokploy-network:
     external: true
