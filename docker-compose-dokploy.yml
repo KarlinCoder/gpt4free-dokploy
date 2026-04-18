@@ -7,5 +7,7 @@ services:
       dockerfile: docker/Dockerfile
     volumes:
       - .:/app
+    ports:
+      - 9876:9875
     environment:
       - OLLAMA_HOST=host.docker.internal
