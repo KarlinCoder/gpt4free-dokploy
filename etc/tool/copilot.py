@@ -18,7 +18,7 @@ g4f.debug.version_check = False
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
 G4F_PROVIDER = os.getenv('G4F_PROVIDER')
-G4F_MODEL = os.getenv('G4F_MODEL') or g4f.models.gpt_4
+G4F_MODEL = os.getenv('G4F_MODEL', '')
 
 def get_pr_details(github: Github) -> PullRequest:
     """
@@ -86,7 +86,7 @@ def read_text(text: str) -> str:
     Returns:
         str: The extracted text.
     """
-    match = re.search(r"```(markdown|)\n(?P<text>[\S\s]+?)\n```", text)
+    match = re.search(r"```(markdown|)\n(?P<text>[\S\s]+?)\n(```|---|$)", text)
     if match:
         return match.group("text")
     else:

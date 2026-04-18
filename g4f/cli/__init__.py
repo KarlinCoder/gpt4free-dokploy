@@ -13,13 +13,18 @@ runtime function depending on the CLI arguments.
 """
 
 import argparse
+import os
+import sys
 from argparse import ArgumentParser
 
-# Local imports (within g4f package)
 from .client import get_parser, run_client_args
 from ..requests import BrowserConfig
 from ..gui.run import gui_parser, run_gui_args
 from ..config import DEFAULT_PORT, DEFAULT_TIMEOUT, DEFAULT_STREAM_TIMEOUT
+from ..Provider.needs_auth.Antigravity import cli_main as antigravity_cli_main
+from ..Provider.qwen.QwenCode import cli_main as qwen_cli_main
+from ..Provider.github.GithubCopilot import cli_main as github_cli_main
+from ..Provider.needs_auth.GeminiCLI import cli_main as gemini_cli_main
 from .. import Provider
 from .. import cookies
 
@@ -27,12 +32,12 @@ from .. import cookies
 # --------------------------------------------------------------
 #  API PARSER
 # --------------------------------------------------------------
-def get_api_parser() -> ArgumentParser:
+def get_api_parser(exit_on_error: bool = True) -> ArgumentParser:
     """
     Creates and returns the argument parser used for:
         g4f api ...
     """
-    api_parser = ArgumentParser(description="Run the API and GUI")
+    api_parser = ArgumentParser(description="Run the API and GUI", exit_on_error=exit_on_error)
 
     api_parser.add_argument(
         "--bind",
@@ -116,6 +121,13 @@ def get_api_parser() -> ArgumentParser:
     )
 
     api_parser.add_argument(
+        "--cookies-dir",
+        type=str,
+        default=None,
+        help="Custom directory for cookies/HAR files (overrides default)."
+    )
+
+    api_parser.add_argument(
         "--g4f-api-key",
         type=str,
         default=None,
@@ -158,6 +170,8 @@ def get_api_parser() -> ArgumentParser:
     api_parser.add_argument("--ssl-keyfile", type=str, default=None, help="SSL key file.")
     api_parser.add_argument("--ssl-certfile", type=str, default=None, help="SSL cert file.")
     api_parser.add_argument("--log-config", type=str, default=None, help="Path to log config.")
+    api_parser.add_argument("--access-log", action="store_true", default=True, help="Enable access logging.")
+    api_parser.add_argument("--no-access-log", dest="access_log", action="store_false", help="Disable access logging.")
 
     api_parser.add_argument(
         "--browser-port",
@@ -206,7 +220,16 @@ def run_api_args(args):
 
     # Custom cookie browsers
     if args.cookie_browsers:
-        cookies.BROWSERS = [cookies[b] for b in args.cookie_browsers]
+        cookies.BROWSERS = [b for b in cookies.BROWSERS if b.__name__ in args.cookie_browsers]
+
+    # Allow overriding the cookies directory from CLI
+    if getattr(args, "cookies_dir", None):
+        # create dir if it doesn't exist and update config
+        try:
+            os.makedirs(args.cookies_dir, exist_ok=True)
+        except Exception:
+            pass
+        cookies.set_cookies_dir(args.cookies_dir)
 
     # Launch server
     run_api(
@@ -219,23 +242,25 @@ def run_api_args(args):
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
         log_config=args.log_config,
+        access_log=args.access_log,
     )
 
 
 # --------------------------------------------------------------
 #  MCP PARSER
 # --------------------------------------------------------------
-def get_mcp_parser() -> ArgumentParser:
+def get_mcp_parser(exit_on_error: bool = True) -> ArgumentParser:
     """
     Parser for:
         g4f mcp ...
     """
-    mcp_parser = ArgumentParser(description="Run the MCP (Model Context Protocol) server")
+    mcp_parser = ArgumentParser(description="Run the MCP (Model Context Protocol) server", exit_on_error=exit_on_error)
     mcp_parser.add_argument("--debug", "-d", action="store_true", help="Enable verbose logging.")
     mcp_parser.add_argument("--http", action="store_true", help="Use HTTP instead of stdio.")
     mcp_parser.add_argument("--host", default="0.0.0.0", help="HTTP server host.")
     mcp_parser.add_argument("--port", type=int, default=8765, help="HTTP server port.")
     mcp_parser.add_argument("--origin", type=str, default=None, help="CORS origin.")
+    mcp_parser.add_argument("--safe", action="store_true", help="Enable safe mode: module allowlist cannot be overridden and workspace root cannot be listed.")
     return mcp_parser
 
 
@@ -248,9 +273,15 @@ def run_mcp_args(args):
         http=args.http,
         host=args.host,
         port=args.port,
-        origin=args.origin
+        origin=args.origin,
+        safe=args.safe,
     )
 
+def get_auth_parser(exit_on_error: bool = True) -> ArgumentParser:
+    auth_parser = ArgumentParser(description="Manage authentication for providers", exit_on_error=exit_on_error)
+    auth_parser.add_argument("provider", choices=["gemini-cli", "antigravity", "qwencode", "github-copilot"], help="The provider to authenticate with")
+    auth_parser.add_argument("action", nargs="?", choices=["status", "login", "logout"], default="login", help="Action to perform (default: login)")
+    return auth_parser
 
 # --------------------------------------------------------------
 #  MAIN ENTRYPOINT
@@ -261,41 +292,122 @@ def main():
     Handles selecting: api / gui / client / mcp
     """
     parser = argparse.ArgumentParser(description="Run gpt4free", exit_on_error=False)
+    parser.add_argument("--install-autocomplete", action="store_true", help="Install Bash autocompletion for g4f CLI.")
+    args, remaining = parser.parse_known_args()
+    if args.install_autocomplete:
+        generate_autocomplete()
+        return
+    
 
-    # Create sub-commands
-    subparsers = parser.add_subparsers(dest="mode", help="Mode to run g4f in.")
-    subparsers.add_parser("api", parents=[get_api_parser()], add_help=False)
-    subparsers.add_parser("gui", parents=[gui_parser()], add_help=False)
-    subparsers.add_parser("client", parents=[get_parser()], add_help=False)
-    subparsers.add_parser("mcp", parents=[get_mcp_parser()], add_help=False)
-
+    mode_parser = ArgumentParser(description="Select mode to run g4f in.", exit_on_error=False)
+    mode_parser.add_argument("mode", nargs="?", choices=["api", "gui", "client", "mcp", "auth", "debug"], default="api", help="Mode to run g4f in (default: api).")
+    
+    # Preserve original remaining so the API parser gets all args if mode
+    # detection fails (e.g. `python -m g4f --port 8080` without a mode prefix).
+    original_remaining = remaining
     try:
-        args = parser.parse_args()
-
-        # Mode routing
-        if args.mode == "api":
+        try:
+            args, remaining = mode_parser.parse_known_args(remaining)
+        except argparse.ArgumentError:
+            parser = get_api_parser(exit_on_error=False)
+            args = parser.parse_args(remaining)
+            run_api_args(args)
+            return
+        if args.mode == "auth":
+            parser = get_auth_parser()
+            args, remaining = parser.parse_known_args(remaining)
+            print(f"Handling auth for provider: {args.provider}, action: {args.action}")
+            handle_auth(args.provider, args.action, remaining)
+            return
+        elif args.mode == "debug":
+            parser = get_api_parser()
+            args = parser.parse_args(remaining)
+            args.debug = True
+            args.reload = True
+            if args.port is None:
+                args.port = 8080
+            run_api_args(args)
+        elif args.mode == "api":
+            parser = get_api_parser()
+            args = parser.parse_args(remaining)
             run_api_args(args)
         elif args.mode == "gui":
+            parser = gui_parser()
+            args = parser.parse_args(remaining)
             run_gui_args(args)
         elif args.mode == "client":
+            parser = get_parser()
+            args = parser.parse_args(remaining)
             run_client_args(args)
         elif args.mode == "mcp":
+            parser = get_mcp_parser()
+            args = parser.parse_args(remaining)
             run_mcp_args(args)
         else:
             # No mode provided
             raise argparse.ArgumentError(
                 None,
-                "No valid mode specified. Use 'api', 'gui', 'client', or 'mcp'."
+                "No valid mode specified. Use 'api', 'gui', 'client', 'mcp', or 'auth'."
             )
 
     except argparse.ArgumentError:
-        # Fallback chain:
-        # 1. Try client mode
-        try:
-            run_client_args(
-                get_parser(exit_on_error=False).parse_args(),
-                exit_on_error=False
-            )
-        except argparse.ArgumentError:
-            # 2. Try API mode with default arguments
-            run_api_args(get_api_parser().parse_args())
+        # Try client mode
+        run_client_args(
+            get_parser(exit_on_error=False).parse_args(),
+            exit_on_error=False
+        )
+
+def generate_autocomplete():
+    # Top-level commands and their subcommands/options
+    commands = ["api", "gui", "client", "mcp", "auth"]
+    auth_providers = ["gemini-cli", "antigravity", "qwencode", "github-copilot"]
+    auth_subcommands = ["status", "login"]
+    # Options for each command
+    api_args = ["--bind", "--port", "--debug", "--gui", "--no-gui", "--model", "--provider", "--media-provider", "--proxy", "--workers", "--disable-colors", "--ignore-cookie-files", "--cookies-dir", "--g4f-api-key", "--ignored-providers", "--cookie-browsers", "--reload", "--demo", "--timeout", "--stream-timeout", "--ssl-keyfile", "--ssl-certfile", "--log-config", "--access-log", "--no-access-log", "--browser-port", "--browser-host"]
+    gui_args = ["--debug"]
+    client_args = ["--debug"]
+    mcp_args = ["--debug", "--http", "--host", "--port", "--origin", "--safe"]
+    global_args = ["--install-autocomplete"]
+    bash_completion_script = f"""
+_g4f_completions() {{
+    local cur prev words cword
+    _get_comp_words_by_ref -n : cur prev words cword
+    if [[ $cword -eq 1 ]]; then
+        COMPREPLY=($(compgen -W '{' '.join(commands + global_args)}' -- "$cur"))
+    elif [[ $prev == auth && $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W '{' '.join(auth_providers)}' -- "$cur"))
+    elif [[ $prev =~ ^(gemini-cli|antigravity|qwencode|github-copilot)$ && $cword -eq 3 ]]; then
+        COMPREPLY=($(compgen -W '{' '.join(auth_subcommands)}' -- "$cur"))
+    elif [[ $words[1] == api ]]; then
+        local opts="{' '.join(api_args)}"
+        COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+    elif [[ $words[1] == gui ]]; then
+        local opts="{' '.join(gui_args)}"
+        COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+    elif [[ $words[1] == client ]]; then
+        local opts="{' '.join(client_args)}"
+        COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+    elif [[ $words[1] == mcp ]]; then
+        local opts="{' '.join(mcp_args)}"
+        COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+    fi
+}}
+complete -F _g4f_completions g4f
+"""
+    completion_file = os.path.expanduser("~/.g4f_bash_completion")
+    with open(completion_file, "w") as f:
+        f.write(bash_completion_script)
+    print(f"Bash completion script written to {completion_file}. Source it in your .bashrc or .bash_profile.")
+
+
+def handle_auth(provider, action, remaining):
+    if provider == "gemini-cli":
+        sys.exit(gemini_cli_main([action] + remaining))
+    elif provider == "antigravity":
+        sys.exit(antigravity_cli_main([action] + remaining))
+    elif provider == "qwencode":
+        sys.exit(qwen_cli_main([action] + remaining))
+    elif provider == "github-copilot":
+        sys.exit(github_cli_main([action] + remaining))
+    else:
+        print(f"Provider {provider} not supported yet.")

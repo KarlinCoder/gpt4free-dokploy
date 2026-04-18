@@ -41,6 +41,8 @@ class CompletionTokenDetails(BaseModel):
     reasoning_tokens: int
     image_tokens: int
     audio_tokens: int
+    accepted_prediction_tokens: Optional[int] = None
+    rejected_prediction_tokens: Optional[int] = None
 
 class UsageModel(BaseModel):
     prompt_tokens: int
@@ -48,6 +50,7 @@ class UsageModel(BaseModel):
     total_tokens: int
     prompt_tokens_details: PromptTokenDetails
     completion_tokens_details: CompletionTokenDetails
+    cache: Optional[str] = None
 
     @classmethod
     def model_construct(cls, prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=None, completion_tokens_details=None, **kwargs):
@@ -65,13 +68,19 @@ class ToolFunctionModel(BaseModel):
     arguments: str
 
 class ToolCallModel(BaseModel):
+    index: int = 0
     id: str
     type: str
     function: ToolFunctionModel
+    extra_content: Optional[dict] = None
 
     @classmethod
-    def model_construct(cls, function=None, **kwargs):
+    def model_construct(cls, function=None, index=0, **kwargs):
+        # Ensure arguments is always a string
+        if function and "arguments" in function and not isinstance(function["arguments"], str):
+            function["arguments"] = str(function["arguments"])
         return super().model_construct(
+            index=index,
             **kwargs,
             function=ToolFunctionModel.model_construct(**function),
         )

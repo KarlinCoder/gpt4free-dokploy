@@ -15,7 +15,7 @@ from typing import Union, AsyncIterator, Iterator, Awaitable, Optional, List, Di
 
 from ..image.copy_images import copy_media, get_media_dir
 from ..typing import Messages, ImageType
-from ..providers.types import ProviderType, BaseRetryProvider, BaseProvider
+from ..providers.types import ProviderType, BaseProvider
 from ..providers.response import *
 from ..errors import NoMediaResponseError, ProviderNotFoundError
 from ..providers.retry_provider import IterListProvider
@@ -70,14 +70,15 @@ def iter_response(
     stream: bool,
     response_format: Optional[dict] = None,
     max_tokens: Optional[int] = None,
-    stop: Optional[list[str]] = None
+    stop: Optional[list[str]] = None,
+    provider_info: Optional[ProviderInfo] = None
 ) -> ChatCompletionResponseType:
     content = ""
     reasoning = []
     finish_reason = None
     tool_calls = None
     usage = None
-    provider: ProviderInfo = None
+    provider_info: ProviderInfo = None
     conversation: JsonConversation = None
     completion_id = ''.join(random.choices(string.ascii_letters + string.digits, k=28))
     idx = 0
@@ -100,7 +101,7 @@ def iter_response(
             usage = chunk
             continue
         elif isinstance(chunk, ProviderInfo):
-            provider = chunk
+            provider_info = chunk
             continue
         elif isinstance(chunk, Reasoning):
             reasoning.append(chunk)
@@ -122,9 +123,9 @@ def iter_response(
 
         if stream:
             chunk = ChatCompletionChunk.model_construct(chunk, None, completion_id, int(time.time()))
-            if provider is not None:
-                chunk.provider = provider.name
-                chunk.model = provider.model
+            if provider_info is not None:
+                chunk.provider = provider_info.name
+                chunk.model = provider_info.model
             yield chunk
 
         if finish_reason is not None:
@@ -135,7 +136,7 @@ def iter_response(
     else:
         usage = UsageModel.model_construct(**usage.get_dict())
 
-    finish_reason = "stop" if finish_reason is None else finish_reason
+    finish_reason = "tool_calls" if tool_calls else ("stop" if finish_reason is None else finish_reason)
 
     if stream:
         chat_completion = ChatCompletionChunk.model_construct(
@@ -153,29 +154,18 @@ def iter_response(
             conversation=None if conversation is None else conversation.get_dict(),
             reasoning=reasoning if reasoning else None
         )
-    if provider is not None:
-        chat_completion.provider = provider.name
-        chat_completion.model = provider.model
+    if provider_info is not None:
+        chat_completion.provider = provider_info.name
+        chat_completion.model = provider_info.model
     yield chat_completion
-
-# Synchronous iter_append_model_and_provider function
-def iter_append_model_and_provider(response: ChatCompletionResponseType, last_model: str, last_provider: ProviderType) -> ChatCompletionResponseType:
-    if isinstance(last_provider, BaseRetryProvider):
-        yield from response
-        return
-    for chunk in response:
-        if isinstance(chunk, (ChatCompletion, ChatCompletionChunk)):
-            if chunk.provider is None and last_provider is not None:
-                chunk.model = getattr(last_provider, "last_model", last_model)
-                chunk.provider = last_provider.__name__
-        yield chunk
 
 async def async_iter_response(
     response: AsyncIterator[Union[str, ResponseType]],
     stream: bool,
     response_format: Optional[dict] = None,
     max_tokens: Optional[int] = None,
-    stop: Optional[list[str]] = None
+    stop: Optional[list[str]] = None,
+    provider_info: Optional[ProviderInfo] = None
 ) -> AsyncChatCompletionResponseType:
     content = ""
     reasoning = []
@@ -184,7 +174,6 @@ async def async_iter_response(
     idx = 0
     tool_calls = None
     usage = None
-    provider: ProviderInfo = None
     conversation: JsonConversation = None
 
     try:
@@ -203,7 +192,7 @@ async def async_iter_response(
                 usage = chunk
                 continue
             elif isinstance(chunk, ProviderInfo):
-                provider = chunk
+                provider_info = chunk
                 continue
             elif isinstance(chunk, Reasoning) and not stream:
                 reasoning.append(chunk)
@@ -225,15 +214,15 @@ async def async_iter_response(
 
             if stream:
                 chunk = ChatCompletionChunk.model_construct(chunk, None, completion_id, int(time.time()))
-                if provider is not None:
-                    chunk.provider = provider.name
-                    chunk.model = provider.model
+                if provider_info is not None:
+                    chunk.provider = provider_info.name
+                    chunk.model = provider_info.model
                 yield chunk
 
             if finish_reason is not None:
                 break
 
-        finish_reason = "stop" if finish_reason is None else finish_reason
+        finish_reason = "tool_calls" if tool_calls else ("stop" if finish_reason is None else finish_reason)
 
         if usage is None:
             usage = UsageModel.model_construct(completion_tokens=idx, total_tokens=idx)
@@ -256,29 +245,10 @@ async def async_iter_response(
                 conversation=conversation,
                 reasoning=reasoning if reasoning else None
             )
-        if provider is not None:
-            chat_completion.provider = provider.name
-            chat_completion.model = provider.model
+        if provider_info is not None:
+            chat_completion.provider = provider_info.name
+            chat_completion.model = provider_info.model
         yield chat_completion
-    finally:
-        await safe_aclose(response)
-
-async def async_iter_append_model_and_provider(
-        response: AsyncChatCompletionResponseType,
-        last_model: str,
-        last_provider: ProviderType
-    ) -> AsyncChatCompletionResponseType:
-    try:
-        if isinstance(last_provider, BaseRetryProvider):
-            async for chunk in response:
-                yield chunk
-            return
-        async for chunk in response:
-            if isinstance(chunk, (ChatCompletion, ChatCompletionChunk)):
-                if chunk.provider is None and last_provider is not None:
-                    chunk.model = getattr(last_provider, "last_model", last_model)
-                    chunk.provider = last_provider.__name__
-            yield chunk
     finally:
         await safe_aclose(response)
 
@@ -290,6 +260,8 @@ class Client(BaseClient):
         **kwargs
     ) -> None:
         super().__init__(**kwargs)
+        if self.base_url and provider is None:
+            provider = create_custom_provider(base_url=self.base_url, api_key=self.api_key)
         self.chat: Chat = Chat(self, provider)
         if media_provider is None:
             media_provider = kwargs.get("image_provider", provider)
@@ -348,9 +320,10 @@ class Completions:
             **kwargs
         )
 
+        provider_info = ProviderInfo(**provider.get_dict(), model=model)
+
         def fallback(response):
-            response = iter_response(response, stream, response_format, max_tokens, stop)
-            return iter_append_model_and_provider(response, model, provider)
+            return iter_response(response, stream, response_format, max_tokens, stop, provider_info)
 
         if raw:
             def raw_response(response):
@@ -443,7 +416,7 @@ class Images:
                         break
                 except Exception as e:
                     error = e
-                    debug.error(f"{provider.__name__} {type(e).__name__}: {e}")
+                    debug.error(f"{provider.__name__}:", e)
         else:
             response = await self._generate_image_response(provider_handler, provider_name, model, prompt, proxy=proxy, api_key=api_key, **kwargs)
         if response is None:
@@ -558,7 +531,7 @@ class Images:
                         break
                 except Exception as e:
                     error = e
-                    debug.error(f"{provider.__name__} {type(e).__name__}: {e}")
+                    debug.error(f"{provider.__name__}:", e)
         else:
             response = await self._generate_image_response(provider_handler, provider_name, model, prompt, **kwargs)
         if response is None:
@@ -687,8 +660,8 @@ class AsyncCompletions:
         )
 
         def fallback(response):
-            response = async_iter_response(response, stream, response_format, max_tokens, stop)
-            return async_iter_append_model_and_provider(response, model, provider)
+            provider_info = ProviderInfo(**provider.get_dict(), model=model)
+            return async_iter_response(response, stream, response_format, max_tokens, stop, provider_info)
 
         if raw:
             async def raw_response(response):
@@ -800,17 +773,13 @@ class ClientFactory:
     
     Supports:
     - Named providers (e.g., "PollinationsAI", "DeepInfra")
-    - Multiple providers (space-separated string or list)
     - Custom providers with custom API base URLs
     - Live providers (dynamically loaded providers)
     
     Example usage:
         # Create client with a named provider
         client = ClientFactory.create_client("PollinationsAI")
-        
-        # Create client with multiple providers (fallback)
-        client = ClientFactory.create_client(["PollinationsAI", "DeepInfra"])
-        
+                
         # Create client with custom provider
         client = ClientFactory.create_client(
             base_url="https://api.example.com/v1",
@@ -818,7 +787,7 @@ class ClientFactory:
         )
         
         # Create async client
-        async_client = ClientFactory.createAsyncClient("PollinationsAI")
+        async_client = ClientFactory.create_async_client("PollinationsAI")
     """
     
     # Registry of live/custom providers
@@ -852,7 +821,7 @@ class ClientFactory:
         elif provider.startswith("custom:"):
             if provider.startswith("custom:"):
                 serverId = provider[7:]
-                base_url = f"https://g4f.dev/custom/{serverId}"
+                base_url = f"https://g4f.space/custom/{serverId}"
             if not base_url:
                 raise ValueError("base_url is required for custom providers")
             provider = create_custom_provider(base_url, api_key, name=name, **kwargs)
@@ -909,10 +878,7 @@ class ClientFactory:
         Example:
             # Named provider
             client = ClientFactory.create_client("PollinationsAI")
-            
-            # Multiple providers (fallback)
-            client = ClientFactory.create_client(["PollinationsAI", "DeepInfra"])
-            
+                        
             # Custom provider
             client = ClientFactory.create_client(
                 base_url="https://api.openai.com/v1",
@@ -954,16 +920,16 @@ class ClientFactory:
             
         Example:
             # Named provider
-            client = ClientFactory.createAsyncClient("PollinationsAI")
+            client = ClientFactory.create_async_client("PollinationsAI")
 
             # Custom provider
-            client = ClientFactory.createAsyncClient(
+            client = ClientFactory.create_async_client(
                 base_url="https://api.openai.com/v1",
                 api_key="sk-..."
             )
         """
         return AsyncClient(
-            provider=cls.createProvider(provider, base_url, api_key, **kwargs),
+            provider=cls.create_provider(None, provider, base_url, api_key, **kwargs),
             media_provider=media_provider,
             api_key=api_key,
             base_url=base_url,

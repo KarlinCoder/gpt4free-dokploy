@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import requests
+from functools import lru_cache
 
 from ..helper import filter_none, format_media_prompt
 from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
@@ -11,11 +12,13 @@ from ...image.copy_images import save_response_media
 from ...providers.response import *
 from ...tools.media import render_messages
 from ...tools.run_tools import AuthManager
+from ...config import AppConfig
 from ...errors import MissingAuthError
 from ... import debug
 
 class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin):
     base_url = ""
+    backup_url = None
     api_key = None
     api_endpoint = None
     supports_message_history = True
@@ -29,19 +32,66 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
     add_user = True
     use_image_size = False
     max_tokens: int = None
+    _checked_api_keys: dict = {}
+
+    @classmethod
+    async def get_quota(cls, api_key: Optional[str] = None, **kwargs) -> dict:
+        """Get the quota information for the API key."""
+        if not api_key:
+            api_key = AuthManager.load_api_key(cls)
+        if api_key and cls.models_needs_auth and cls.quota_url is None:
+            cls.quota_url = f"{cls.base_url}/models"
+        if cls.quota_url is None:
+            if cls.backup_url is not None:
+                cls.quota_url = f"{cls.backup_url}/chat/completions"
+        if cls.quota_url is not None:
+            return await super().get_quota(api_key=api_key, **kwargs)
+        if not api_key and cls.needs_auth:
+            raise MissingAuthError("API key is required.")
+        if not cls.default_model:
+            raise NotImplementedError("No default model specified.")
+        return await cls.test_api_key(api_key)
+    
+    @classmethod
+    async def test_api_key(cls, api_key: str):
+        if api_key in cls._checked_api_keys:
+            return cls._checked_api_keys[api_key]
+        url = f"{cls.base_url}/chat/completions"
+        headers = {
+            "authorization": f"Bearer {api_key}"
+        } if api_key else {}
+        json_data = {
+            "model": cls.default_model,
+            "messages": [{"role": "user", "content": "say only okay"}],
+            "max_tokens": 1
+        }
+        async with StreamSession() as session:
+            async with session.post(url, headers=headers, json=json_data) as response:
+                await raise_for_status(response)
+                result = await response.json()
+                cls._checked_api_keys[api_key] = result
+                return result
+
+    @classmethod
+    def is_provider_api_key(cls, api_key: str) -> bool:
+        if cls.backup_url is None:
+            return True
+        return api_key and not api_key.startswith("g4f_") and not api_key.startswith("gfs_")
 
     @classmethod
     def get_models(cls, api_key: str = None, base_url: str = None, timeout: int = None) -> list[str]:
         if not cls.models:
             try:
-                if base_url is None:
-                    base_url = cls.base_url
                 if api_key is None and cls.api_key is not None:
                     api_key = cls.api_key
-                if not api_key:
+                if not api_key or AppConfig.disable_custom_api_key:
                     api_key = AuthManager.load_api_key(cls)
-                if cls.models_needs_auth and not api_key:
-                    raise MissingAuthError('Add a "api_key"')
+                if base_url is None:
+                    base_url = cls.base_url
+                    if not cls.is_provider_api_key(api_key):
+                        base_url = cls.backup_url
+                    elif cls.models_needs_auth and not api_key:
+                        raise MissingAuthError("API key is required.")
                 response = requests.get(f"{base_url}/models", headers=cls.get_headers(False, api_key), verify=cls.ssl, timeout=timeout)
                 response.raise_for_status()
                 data = response.json()
@@ -51,9 +101,12 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
                 cls.image_models = [model.get("name") if cls.use_model_names else model.get("id", model.get("name")) for model in data if model.get("image") or model.get("type") == "image" or model.get("supports_images")]
                 cls.vision_models = cls.vision_models.copy()
                 cls.vision_models += [model.get("name") if cls.use_model_names else model.get("id", model.get("name")) for model in data if model.get("vision")]
-                cls.models = [model.get("name") if cls.use_model_names else model.get("id", model.get("name")) for model in data]
+                cls.models = {model.get("name") if cls.use_model_names else model.get("id", model.get("name")): model for model in data}
+                for key, value in cls.models.items():
+                    value.pop("id")
+                    cls.models[key] = {"id": key, **value}
                 cls.models_count = {model.get("name") if cls.use_model_names else model.get("id", model.get("name")): len(model.get("providers", [])) for model in data if len(model.get("providers", [])) > 1}
-                if cls.sort_models:
+                if cls.sort_models and isinstance(cls.models, list):
                     cls.models.sort()
             except MissingAuthError:
                 raise
@@ -102,7 +155,7 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
         ) as session:
             model = cls.get_model(model, api_key=api_key, base_url=base_url)
             if base_url is None:
-                base_url = cls.base_url
+                base_url = cls.base_url if cls.is_provider_api_key(api_key) else cls.backup_url
 
             # Proxy for image generation feature
             if model and model in cls.image_models:
@@ -121,7 +174,7 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
                     if model:
                         yield ProviderInfo(**cls.get_dict(), model=model)
                     await raise_for_status(response)
-                    yield ImageResponse([image["url"] for image in data["data"]], prompt)
+                    yield ImageResponse([f"data:image/png;base64,{image['b64_json']}" if image.get("url") is None else image["url"] for image in data["data"]], prompt)
                 return
 
             if stream or stream is None:
@@ -165,6 +218,7 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
         }
     
 async def read_response(response: StreamResponse, stream: bool, prompt: str, provider_info: dict, download_media: bool) -> AsyncResult:
+    yield HeadersResponse.from_dict({key: value for key, value in response.headers.items() if key.lower().startswith("x-")})
     content_type = response.headers.get("content-type", "text/event-stream" if stream else "application/json")
     if content_type.startswith("application/json"):
         data = await response.json()
@@ -178,7 +232,7 @@ async def read_response(response: StreamResponse, stream: bool, prompt: str, pro
         if model:
             yield ProviderInfo(**provider_info, model=model)
         if "usage" in data:
-            yield Usage(**data["usage"])
+            yield Usage.from_dict(data["usage"])
         if "conversation" in data:
             yield JsonConversation.from_dict(data["conversation"])
         if "choices" in data:
@@ -233,8 +287,8 @@ async def read_response(response: StreamResponse, stream: bool, prompt: str, pro
                 if reasoning_content:
                     reasoning = True
                     yield Reasoning(reasoning_content)
-            if "usage" in data and data["usage"]:
-                yield Usage(**data["usage"])
+            if "usage" in data and data["usage"] and "total_tokens" in data["usage"]:
+                yield Usage.from_dict(data["usage"])
             if "conversation" in data and data["conversation"]:
                 yield JsonConversation.from_dict(data["conversation"])
             if choice and choice.get("finish_reason") is not None:

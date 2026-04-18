@@ -22,6 +22,7 @@ class PuterJS(AsyncGeneratorProvider, ProviderModelMixin):
     working = True
     active_by_default = True
     needs_auth = True
+    quota_url = "https://api.puter.com/metering/usage"
 
     default_model = 'gpt-4o'
     default_vision_model = default_model

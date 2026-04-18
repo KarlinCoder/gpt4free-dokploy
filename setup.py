@@ -14,7 +14,7 @@ INSTALL_REQUIRE = [
     "aiohttp",
     "brotli",
     "pycryptodome",
-    "nest_asyncio",
+    "nest-asyncio2",
 ]
 
 EXTRA_REQUIRE = {
@@ -28,16 +28,21 @@ EXTRA_REQUIRE = {
         "aiohttp_socks",           # proxy
         "pillow",                  # image
         "cairosvg",                # svg image
-        "werkzeug", "flask",       # gui
+        "werkzeug",
+        "flask[async]",            # gui
         "fastapi",                 # api
         "uvicorn",                 # api
-        "nodriver",
+        "zendriver",
         "python-multipart",
         "a2wsgi",
         "setuptools",
         "markitdown[all]",
         "python-dotenv",
-        "aiofile"
+        "aiofile",
+        "cloudscraper",
+        "wasmtime",
+        "numpy",
+        "PyYAML",
     ],
     'slim': [
         "curl_cffi>=0.6.2",
@@ -47,21 +52,24 @@ EXTRA_REQUIRE = {
         "beautifulsoup4", # web_search and bing.create_images
         "aiohttp_socks",           # proxy
         "pillow",                  # image
-        "werkzeug", "flask",       # gui
+        "werkzeug",
+        "flask[async]",            # gui
         "fastapi",                 # api
         "uvicorn",                 # api
-        "nodriver",
+        "zendriver",
         "python-multipart",
         "a2wsgi",
         "pypdf2",
         "python-docx",
         "python-dotenv",
-        "aiofile"
+        "aiofile",
+        "cloudscraper",
+        "PyYAML",
     ],
     "image": [
         "pillow",
         "cairosvg",
-        "beautifulsoup4"
+        "beautifulsoup4",
     ],
     "webview": [
         "pywebview",
@@ -74,9 +82,10 @@ EXTRA_REQUIRE = {
         "uvicorn",
         "python-multipart",
         "a2wsgi",
+        "PyYAML"
     ],
     "gui": [
-        "werkzeug", "flask",
+        "werkzeug", "flask[async]",
         "beautifulsoup4", "pillow",
     ],
     "search": [
@@ -89,7 +98,7 @@ EXTRA_REQUIRE = {
     ],
     "files": [
         "beautifulsoup4",
-        "markitdown[all]"
+        "markitdown[all]",
     ]
 }
 

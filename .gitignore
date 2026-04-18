@@ -10,3 +10,5 @@ models/models.json
 pyvenv.cfg
 lib64
 /.idea
+container/
+g4f.dev

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import flask
 import os
+import re
 import time
 import base64
 import logging
@@ -36,6 +37,7 @@ try:
 except ImportError:
     has_crypto = False
 
+from ...client import Client
 from ...client.service import convert_to_provider
 from ...providers.asyncio import to_sync_generator
 from ...providers.response import FinishReason, AudioResponse, MediaResponse, Reasoning, HiddenResponse, JsonResponse
@@ -43,16 +45,19 @@ from ...client.helper import filter_markdown
 from ...tools.files import supports_filename, get_streaming, get_bucket_dir, get_tempfile
 from ...tools.run_tools import iter_run_tools
 from ...errors import ModelNotFoundError, ProviderNotFoundError, MissingAuthError, RateLimitError
-from ...image import is_allowed_extension, process_image, MEDIA_TYPE_MAP
+from ...image import is_allowed_extension, process_image, MEDIA_TYPE_MAP, is_safe_url as _is_safe_url
 from ...cookies import get_cookies_dir
 from ...image.copy_images import secure_filename, get_source_url, get_media_dir, copy_media
 from ...client.service import get_model_and_provider
 from ...providers.any_model_map import model_map
 from ... import Provider
 from ... import models
+from ...Provider import ProviderUtils
 from .api import Api
 
 logger = logging.getLogger(__name__)
+
+_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 def safe_iter_generator(generator: Generator) -> Generator:
     start = next(generator)
@@ -81,6 +86,7 @@ class Backend_Api(Api):
         """
         self.app: Flask = app
         self.chat_cache = {}
+        self.client = Client()
 
         if has_crypto:
             private_key_obj = get_session_key()
@@ -126,6 +132,84 @@ class Backend_Api(Api):
                     "user": request.headers.get("x-user", "error")
                 })
 
+        @app.route('/pa/backend-api/v2/conversation', methods=['POST'])
+        async def pa_backend_conversation():
+            """GUI-compatible streaming conversation endpoint for PA providers.
+
+            Accepts the same JSON body as ``/backend-api/v2/conversation`` and
+            streams Server-Sent Events in the same format used by the gpt4free
+            web interface (``{"type": "content", "content": "..."}`` etc.).
+
+            The ``provider`` field should contain the opaque PA provider ID
+            returned by ``GET /pa/providers``.  When omitted the first available
+            PA provider is used.
+            """
+            from g4f.mcp.pa_provider import get_pa_registry
+
+            if app.demo and has_crypto:
+                secret = request.headers.get("x-secret", request.headers.get("x_secret"))
+                if not secret or not validate_secret(secret):
+                    return jsonify({"error": {"message": "Invalid or missing secret"}}), 403
+
+            try:
+                body = {**request.json}
+            except Exception:
+                return jsonify({"error": {"message": "Invalid JSON body"}}), 422
+
+            registry = get_pa_registry()
+            pid = body.get("provider")
+            if pid:
+                provider_cls = registry.get_provider_class(pid)
+                if provider_cls is None:
+                    return jsonify({"error": {"message": f"PA provider '{pid}' not found"}}), 404
+            else:
+                listing = registry.list_providers()
+                if not listing:
+                    return jsonify({"error": {"message": "No PA providers found in workspace"}}), 404
+                provider_cls = registry.get_provider_class(listing[0]["id"])
+
+            provider_label = getattr(provider_cls, "label", provider_cls.__name__)
+            messages = body.get("messages") or []
+            model = body.get("model") or getattr(provider_cls, "default_model", "") or ""
+
+            def gen_backend_stream():
+                yield (
+                    "data: "
+                    + json.dumps({"type": "provider", "provider": {"name": pid, "label": provider_label, "model": model}})
+                    + "\n\n"
+                )
+                try:
+                    provider = provider_cls()
+                    provider.__name__ = provider_cls.__name__
+                    response = self.client.chat.completions.create(
+                        messages=messages,
+                        model=model,
+                        provider=provider,
+                        stream=True,
+                    )
+                    for chunk in response:
+                        if chunk.choices[0].delta.content:
+                            yield f"data: {json.dumps({'type': 'content', 'content': str(chunk.choices[0].delta.content)})}\n\n"
+                except GeneratorExit:
+                    pass
+                except Exception as e:
+                    logger.exception(e)
+                    yield (
+                        "data: "
+                        + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"})
+                        + "\n\n"
+                    )
+                yield (
+                    "data: "
+                    + json.dumps({"type": "finish", "finish": "stop"})
+                    + "\n\n"
+                )
+
+            return self.app.response_class(
+                safe_iter_generator(gen_backend_stream()),
+                mimetype='text/event-stream'
+            )
+
         @app.route('/backend-api/v2/models', methods=['GET'])
         @lru_cache(maxsize=1)
         def jsonify_models():
@@ -149,20 +233,61 @@ class Backend_Api(Api):
             response = self.get_providers(**kwargs)
             return jsonify(response)
 
-        def get_demo_models():
-            return [{
-                "name": model.name,
-                "image": isinstance(model, models.ImageModel),
-                "vision": isinstance(model, models.VisionModel),
-                "audio": isinstance(model, models.AudioModel),
-                "video": isinstance(model, models.VideoModel),
-                "providers": [
-                    provider.get_parent()
-                    for provider in providers
-                ],
-                "demo": True
-            }
-            for model, providers in models.demo_models.values()]
+        @app.route('/backend-api/v2/oauth/<provider>', methods=['GET', 'POST'])
+        def oauth_login(provider: str):
+            timeout = 300.0
+            if request.method == 'GET':
+                timeout = float(request.args.get('timeout') or timeout)
+            else:
+                try:
+                    data = request.get_json(silent=True) or {}
+                    timeout = float(data.get('timeout') or timeout)
+                except Exception:
+                    pass
+
+            # Resolve provider class
+            try:
+                provider_class = ProviderUtils.get_by_label(provider)
+            except ValueError as e:
+                return jsonify({"error": {"message": str(e)}}), 404
+
+            if request.method == 'GET':
+                data = request.args.to_dict() or {}
+            else:
+                data = request.get_json(silent=True) or {}
+
+            action = data.get("action", "start")
+
+            # Github Copilot device flow: start/poll actions
+            if hasattr(provider_class, "oauth_start") and action == "start":
+                try:
+                    result = asyncio.run(provider_class.oauth_start())
+                    return jsonify(result), 200
+                except Exception as e:
+                    logger.exception(e)
+                    return jsonify({"error": {"message": str(e)}}), 500
+
+            if hasattr(provider_class, "oauth_poll") and action == "poll":
+                device_code = data.get("device_code")
+                if not device_code:
+                    return jsonify({"error": {"message": "device_code is required for poll action"}}), 400
+                try:
+                    result = asyncio.run(provider_class.oauth_poll(device_code))
+                    return jsonify(result), 200
+                except Exception as e:
+                    logger.exception(e)
+                    return jsonify({"error": {"message": str(e)}}), 500
+
+            # Fallback: provider.login (blocking) for interactive login flows
+            if hasattr(provider_class, "login"):
+                try:
+                    asyncio.run(provider_class.login())
+                    return jsonify({"status": "success"}), 200
+                except Exception as e:
+                    logger.exception(e)
+                    return jsonify({"error": {"message": str(e)}}), 500
+
+            return jsonify({"error": {"message": f"Provider {provider} does not support OAuth login"}}), 404
 
         def handle_conversation():
             """
@@ -180,6 +305,10 @@ class Backend_Api(Api):
             except json.JSONDecodeError as e:
                 logger.exception(e)
                 return jsonify({"error": {"message": "Invalid JSON data"}}), 400
+            if "proxy" in json_data:
+                del json_data["proxy"]
+            if json_data.get("provider") != "Custom" and "base_url" in json_data:
+                del json_data["base_url"]
             if app.demo and has_crypto:
                 secret = request.headers.get("x-secret", request.headers.get("x_secret"))
                 if not secret or not validate_secret(secret):
@@ -194,6 +323,8 @@ class Backend_Api(Api):
                         media.append((Path(newfile), file.filename))
             if "media_url" in request.form:
                 for url in request.form.getlist("media_url"):
+                    if not _is_safe_url(url):
+                        return jsonify({"error": {"message": f"Invalid or disallowed media_url: {url}"}}), 400
                     media.append((url, None))
             if media:
                 json_data['media'] = media
@@ -246,12 +377,37 @@ class Backend_Api(Api):
     
         @app.route('/backend-api/v2/usage/<date>', methods=['GET'])
         def get_usage(date: str):
+            if not _DATE_RE.match(date):
+                return (jsonify({"error": {"message": "Invalid date format"}}), 400)
+            try:
+                datetime.date.fromisoformat(date)
+            except ValueError:
+                return (jsonify({"error": {"message": "Invalid date"}}), 400)
             cache_dir = Path(get_cookies_dir()) / ".usage"
             cache_file = cache_dir / f"{date}.jsonl"
             if cache_file.exists():
                 return Response(cache_file.read_text(), mimetype='text/plain')
             else:
                 return (jsonify({"error": {"message": "No usage data found for this date"}}), 404)
+
+        @app.route('/backend-api/v2/quota/<provider>', methods=['GET'])
+        async def get_quota(provider: str):
+            try:
+                provider_handler = convert_to_provider(provider)
+            except ProviderNotFoundError:
+                return "Provider not found", 404
+            if not hasattr(provider_handler, "get_quota"):
+                return "Provider doesn't support get_quota", 500
+            request_api_key = request.headers.get("x-api-key")
+            try:
+                return jsonify(await provider_handler.get_quota(api_key=request_api_key))
+            except MissingAuthError as e:
+                return jsonify({"error": {"message": f"{type(e).__name__}: {e}"}}), 401
+            except NotImplementedError as e:
+                return jsonify({"error": {"message": f"{type(e).__name__}: {e}"}}), 501
+            except Exception as e:
+                logger.exception(e)
+                return jsonify({"error": {"message": f"{type(e).__name__}: {e}"}}), 500
 
         @app.route('/backend-api/v2/log', methods=['POST'])
         def add_log():
@@ -285,7 +441,8 @@ class Backend_Api(Api):
         @app.route('/backend-api/v2/version', methods=['GET'])
         def version():
             resp = jsonify(self.get_version())
-            resp.set_cookie('fingerprint', base64.b64encode(str(int(time.time())).encode()).decode(), max_age=60 * 60 *2, httponly=True, secure=True)
+            if not request.args.get("cache"):
+                resp.set_cookie('fingerprint', base64.b64encode(str(int(time.time())).encode()).decode(), max_age=60 * 60 *2, httponly=True, secure=True)
             return resp
 
         @app.route('/backend-api/v2/create', methods=['GET'])
@@ -331,7 +488,7 @@ class Backend_Api(Api):
                         for chunk in response:
                             if isinstance(chunk, FinishReason):
                                 yield f"[{chunk.reason}]" if chunk.reason != "stop" else ""
-                            elif not isinstance(chunk, Exception):
+                            elif not isinstance(chunk, (Exception, JsonResponse)):
                                 chunk = str(chunk)
                                 if chunk:
                                     yield chunk
@@ -568,10 +725,10 @@ class Backend_Api(Api):
         def upload_chat(share_id: str) -> dict:
             chat_data = {**request.json}
             updated = chat_data.get("updated", 0)
+            share_id = secure_filename(share_id)
             cache_value = self.chat_cache.get(share_id, 0)
             if updated == cache_value:
                 return {"share_id": share_id}
-            share_id = secure_filename(share_id)
             bucket_dir = get_bucket_dir(share_id)
             os.makedirs(bucket_dir, exist_ok=True)
             with open(os.path.join(bucket_dir, "chat.json"), 'w', encoding="utf-8") as f:
@@ -600,7 +757,7 @@ class Backend_Api(Api):
 
     def get_provider_models(self, provider: str):
         api_key = request.headers.get("x-api-key")
-        base_url = request.headers.get("x-api-base")
+        base_url = request.headers.get("x-api-base") if provider == "Custom" else None
         ignored = request.headers.get("x-ignored", "").split()
         return super().get_provider_models(provider, api_key, base_url, ignored)
 

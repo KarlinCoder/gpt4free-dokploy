@@ -9,10 +9,10 @@ from urllib.parse import quote, quote_plus
 from aiohttp import ClientSession
 
 try:
-    import nodriver
-    from nodriver.core.connection import ProtocolException
+    import zendriver as nodriver
+    from zendriver.core.connection import ProtocolException
     has_nodriver = True
-except:
+except Exception:
     has_nodriver = False
 
 from ...typing import Messages, AsyncResult
@@ -22,7 +22,7 @@ from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin
 from ..helper import format_media_prompt
 from ... import debug
 
-PUBLIC_URL = "https://home.g4f.dev"
+PUBLIC_URL = "https://g4f.space"
 SEARCH_URL = f"{PUBLIC_URL}/search/video+"
 
 class RequestConfig:
@@ -40,11 +40,15 @@ class RequestConfig:
             async with ClientSession() as session:
                 found_urls = []
                 for skip in range(0, 9):
-                    async with session.get(SEARCH_URL + quote_plus(prompt) + f"?skip={skip}", timeout=ClientTimeout(total=10)) as response:
-                        if response.ok:
-                            found_urls.append(str(response.url))
-                        else:
-                            break
+                    try:
+                        async with session.get(SEARCH_URL + quote_plus(prompt) + f"?skip={skip}", timeout=ClientTimeout(total=10)) as response:
+                            if response.ok:
+                                found_urls.append(str(response.url))
+                            else:
+                                break
+                    except Exception as e:
+                        debug.error(f"Error fetching video URLs:", e)
+                        break
                 if found_urls:
                     return VideoResponse(found_urls, prompt)
 
@@ -120,11 +124,13 @@ class Video(AsyncGeneratorProvider, ProviderModelMixin):
             yield ContinueResponse("Timeout waiting for Video URL")
             page = await browser.get(cls.urls[model].format(quote(prompt)))
         except Exception as e:
-            stop_browser()
+            await stop_browser()
             debug.error(f"Error opening page:", e)
         if prompt not in RequestConfig.urls:
             RequestConfig.urls[prompt] = []
         def on_request(event: nodriver.cdp.network.RequestWillBeSent, page=None):
+            if not hasattr(event, "request"):
+                return
             if event.request.url.startswith(cls.drive_url) or ".mp4" in event.request.url:
                 RequestConfig.headers = {}
                 for key, value in event.request.headers.items():
@@ -141,7 +147,7 @@ class Video(AsyncGeneratorProvider, ProviderModelMixin):
             if button:
                 break
             if idx == 299:
-                stop_browser()
+                await stop_browser()
                 raise RuntimeError("Failed to wait for user menu.")
         if model == "search" and page is not None:
             await page.send(nodriver.cdp.network.enable())
@@ -151,7 +157,7 @@ class Video(AsyncGeneratorProvider, ProviderModelMixin):
                 await asyncio.sleep(1)
         response = await RequestConfig.get_response(prompt, True)
         if response:
-            stop_browser()
+            await stop_browser()
             yield Reasoning(label="Found", status="")
             yield response
             return
@@ -229,7 +235,7 @@ class Video(AsyncGeneratorProvider, ProviderModelMixin):
                     if idx == 59:
                         debug.error(e)
                 if idx == 59:
-                    stop_browser()
+                    await stop_browser()
                     raise RuntimeError("Failed to click 'New Video' button")
             await asyncio.sleep(3)
             if model != "search" and page is not None:
@@ -242,12 +248,12 @@ class Video(AsyncGeneratorProvider, ProviderModelMixin):
                     await asyncio.sleep(2)
                     response = await RequestConfig.get_response(prompt, model=="search")
                     if response:
-                        stop_browser()
+                        await stop_browser()
                         yield Reasoning(label="Finished", status="")
                         yield response
                         return
                 if idx == 299:
-                    stop_browser()
+                    await stop_browser()
                     raise RuntimeError("Failed to get Video URL")
         finally:
-            stop_browser()
+            await stop_browser()

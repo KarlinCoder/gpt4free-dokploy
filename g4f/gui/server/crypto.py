@@ -39,6 +39,7 @@ def create_or_read_keys() -> tuple[RSAPrivateKey, RSAPublicKey]:
         return private_key, public_key
 
     # Generate keys
+    # Note: Using 1024 bits for the session key so the user can put it his secret (captcha)
     private_key_obj = rsa.generate_private_key(public_exponent=65537, key_size=1024)
     public_key_obj = private_key_obj.public_key()
 
